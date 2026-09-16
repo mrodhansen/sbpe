@@ -46,7 +46,9 @@ refs = dotdict(
     overrideW=0, overrideH=0,  # fake values to return from XDL_GetWindowSize
     windowW=0, windowH=0,  # current window size
     scaleX=1, scaleY=1,    # current window scale
-    lastMove=0  # timestamp of last mouse movement
+    lastMove=0,  # timestamp of last mouse movement
+    _tfname='',
+    _tex_user_cb=None,
 )
 
 refs.VERSION = VERSION
@@ -74,8 +76,11 @@ def hook_DoEvents():
 
 @ffi.def_extern()
 def hook_Clear(color):
-    util.updateState()
-    refs.manager.runCallbacks('afterUpdate')
+    try:
+        util.updateState()
+        refs.manager.runCallbacks('afterUpdate')
+    except Exception:
+        logging.exception('hook_Clear')
     if refs.stage[0] != ffi.NULL:
         ORIGS['XDL_Clear'](refs.stage[0].backgroundColor)
     else:
@@ -84,7 +89,10 @@ def hook_Clear(color):
 
 @ffi.def_extern()
 def hook_Present():
-    refs.manager.runCallbacks('onPresent')
+    try:
+        refs.manager.runCallbacks('onPresent')
+    except Exception:
+        logging.exception('hook_Present')
     ORIGS['XDL_Present']()
 
 
@@ -122,28 +130,34 @@ def hook_mouseButton(x, y, button, down, userData):
 
 @ffi.def_extern()
 def hook_LoadTextureFile(name, callback, userData):
-    refs._tfname = ffi.string(name).decode()
-
-    hook = lib.subhook_new(callback, lib.hook_textureCallback, 0)
-    refs._orig_callback = ffi.cast(
-        'XDL_LoadTextureDoneCallback', lib.subhook_get_trampoline(hook))
-
-    lib.subhook_install(hook)
-    ORIGS['XDL_LoadTextureFile'](name, callback, userData)
-    lib.subhook_remove(hook)
-    lib.subhook_free(hook)
+    try:
+        refs._tfname = ffi.string(name).decode()
+        logging.info('loadtex %s', refs._tfname)
+        refs._tex_user_cb = callback
+        ORIGS['XDL_LoadTextureFile'](name, lib.hook_textureCallback, userData)
+    except Exception:
+        logging.exception('hook_LoadTextureFile')
+        ORIGS['XDL_LoadTextureFile'](name, callback, userData)
 
 
 @ffi.def_extern()
 def hook_textureCallback(texture, sptr):
-    refs._orig_callback(texture, sptr)
-
-    tname = refs._tfname.split('/')
-    pname, sid = tname[1].split('.', 1)
-    sid = sid.split('.')
-    if tname[0] != 'texture' or sid[0] != 'm0':
-        return
-    util.loadMipmaps(pname, sid[1])
+    try:
+        cb = refs._tex_user_cb
+        if cb is not None:
+            cb(texture, sptr)
+    except Exception:
+        logging.exception('orig texture callback')
+    try:
+        path = refs._tfname.replace('\\', '/').split('/')
+        fname = path[-1]
+        folder = path[-2] if len(path) >= 2 else ''
+        parts = fname.split('.')
+        if folder != 'texture' or len(parts) < 3 or parts[1] != 'm0':
+            return
+        util.loadMipmaps(parts[0], parts[2])
+    except Exception:
+        logging.exception('loadMipmaps')
 
 
 def initHooks():
@@ -153,7 +167,8 @@ def initHooks():
         nonlocal ok
         hook = lib.subhook_new(refs[fname], hookfunc, 1)
         orig = ffi.cast('p' + fname, lib.subhook_get_trampoline(hook))
-        if orig != ffi.NULL:
+        # LoadTextureFile trampoline crashes under Rosetta; always wrap.
+        if orig != ffi.NULL and fname != 'XDL_LoadTextureFile':
             ORIGS[fname] = orig
         else:
             logging.info('{}: no trampoline, using fallback'.format(fname))
@@ -181,7 +196,12 @@ def initHooks():
     addhook('mouseButtonCallback', lib.hook_mouseButton)
 
     if refs.config.getboolean('general', 'mipmaps', fallback=False):
-        addhook('XDL_LoadTextureFile', lib.hook_LoadTextureFile)
+        if platform.system() == 'Darwin':
+            # subhooking LoadTextureFile / its completion cb abort()s under
+            # Rosetta. m0 sheets from dataVersion.m.bpb still load.
+            logging.info('mipmaps: m0 sheets only (skipping LoadTextureFile hook)')
+        else:
+            addhook('XDL_LoadTextureFile', lib.hook_LoadTextureFile)
     return ok
 
 

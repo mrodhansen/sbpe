@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 import platform
 
 from _remote import ffi, lib
@@ -96,7 +97,8 @@ class PlainText(object):
             return
         if self._dirty:
             self.updateTexture()
-            self._dirty = False
+            # Retry next frame if the GL text atlas is not ready yet.
+            self._dirty = self._texture <= 0
         if self._texture <= 0:
             return
 
@@ -104,6 +106,7 @@ class PlainText(object):
         h = self.h
 
         if not self.screenCoords:
+            # Canvas/world pixels → window pixels (zoom-safe).
             x /= refs.scaleX
             y /= refs.scaleY
 
@@ -188,6 +191,12 @@ class NumberDict(PlainText):
 
         _nw = ffi.new('int *')
         _nh = ffi.new('int *')
+        try:
+            num = int(num)
+        except (TypeError, ValueError):
+            return
+        if num < -99999 or num > 99999:
+            return
         refs.XDL_SizeFromNumberDict(self._texture, num, _nw, _nh)
         nw = _nw[0]
         nh = _nh[0]
@@ -233,11 +242,17 @@ def loadMipmaps(pname, sheet):
         return
 
     for level in range(1, maxlevel + 1):
-        fname = 'data/texture/{}.m{}.{}.png'.format(pname, level, sheet)
-        try:
-            img = Image.open(fname)
-        except IOError:
-            logging.error('could not load: "{}"'.format(fname))
+        rel = 'data/texture/{}.m{}.{}.png'.format(pname, level, sheet)
+        candidates = [rel, os.path.join(os.getcwd(), rel)]
+        img = None
+        for fname in candidates:
+            try:
+                img = Image.open(fname)
+                break
+            except IOError:
+                continue
+        if img is None:
+            logging.error('could not load: "{}"'.format(rel))
             return
         pixels = ffi.from_buffer(img.tobytes())
         refs.glTexImage2D(
@@ -267,8 +282,19 @@ def updateState():
         if ww > 0 and wh > 0:
             refs.windowW = ww
             refs.windowH = wh
-            refs.scaleX = refs.canvasW_[0] / ww
-            refs.scaleY = refs.canvasH_[0] / wh
+        elif refs.canvasW_[0] > 0 and refs.canvasH_[0] > 0:
+            refs.windowW = refs.canvasW_[0]
+            refs.windowH = refs.canvasH_[0]
+        if refs.windowW > 0 and refs.windowH > 0:
+            refs.scaleX = refs.canvasW_[0] / refs.windowW
+            refs.scaleY = refs.canvasH_[0] / refs.windowH
+        if not getattr(updateState, '_loggedWin', False) and refs.windowW:
+            logging.info(
+                'window %dx%d canvas %dx%d scale %.3f,%.3f',
+                refs.windowW, refs.windowH,
+                refs.canvasW_[0], refs.canvasH_[0],
+                refs.scaleX, refs.scaleY)
+            updateState._loggedWin = True
 
     if refs.stage[0] == ffi.NULL:
         return
@@ -299,36 +325,39 @@ def updateState():
     else:
         refs.MainMenu = ffi.NULL
 
-    # game client — only publish nested pointers after the vtable name matches.
-    # GameClient.worldClient / WorldClient.clientWorld offsets match the Mac
-    # binary; following a not-yet-constructed pointer still SIGSEGVs plugins.
+    # GameClient.worldClient is 0x80 / WorldClient.clientWorld 0x78 on Mac.
+    # Probe the page before vtable reads so a stale pointer cannot SIGSEGV.
     refs.GameClient = refs.WorldClient = refs.ClientWorld =\
         refs.WorldView = refs.HUD = refs.player = refs.serverSubWorld = ffi.NULL
 
     if types[0] == 'GameClient':
         refs.GameClient = tops[0]
-        if platform.system() == 'Darwin':
-            # Do not dereference generated.h nested pointers. A wrong
-            # worldClient/clientWorld value is often 8-byte-aligned and in
-            # _ptr_ok range but unmapped; getClassName then SIGSEGVs.
-            wc = _ui_find(refs.GameClient, 'WorldClient')
+        # UI-find WorldClient only. Do not getClassName nested pointers —
+        # that SIGSEGVd in hook_Clear once WC appeared.
+        wc = _ui_find(refs.GameClient, 'WorldClient')
+        if wc != ffi.NULL:
             refs.WorldClient = wc
-            if wc != ffi.NULL:
-                refs.WorldView = _ui_find(wc, 'WorldView')
-                refs.HUD = _ui_find(wc, 'HUD')
-            _log_world_bind()
-        else:
-            wc = _typed_ptr(refs.GameClient.worldClient, 'WorldClient')
-            if wc != ffi.NULL:
-                refs.WorldClient = wc
-                cw = _typed_ptr(wc.clientWorld, 'ClientWorld')
-                wv = _typed_ptr(wc.worldView, 'WorldView')
-                if cw != ffi.NULL and wv != ffi.NULL:
-                    refs.ClientWorld = cw
-                    refs.WorldView = wv
-                    refs.player = cw.player
-                    refs.serverSubWorld = cw.serverSubWorld
-                    refs.HUD = wc.hud
+            cw = wc.clientWorld
+            wv = wc.worldView
+            hud = wc.hud
+            # ClientWorld is malloc(0x520); require the whole object, not just
+            # the first pointer, before reading player / serverSubWorld.
+            if _ptr_mapped(cw, 0x520):
+                refs.ClientWorld = ffi.cast('struct ClientWorld *', cw)
+                plr = player_ptr(refs.ClientWorld)
+                refs.player = plr if player_looks_alive(plr) else ffi.NULL
+                ssw = refs.ClientWorld.serverSubWorld
+                refs.serverSubWorld = ssw if _ptr_mapped(ssw, 8) else ffi.NULL
+                if platform.system() == 'Darwin':
+                    mac_ssw = _mac_load_ptr(
+                        cw, _MAC_CW_SERVER, 'struct ForeignSubWorld *')
+                    if mac_ssw != ffi.NULL:
+                        refs.serverSubWorld = mac_ssw
+            if _ptr_mapped(wv, 64):
+                refs.WorldView = ffi.cast('struct WorldView *', wv)
+            if _ptr_mapped(hud, 64):
+                refs.HUD = ffi.cast('struct HUD *', hud)
+        _log_world_bind()
 
     # add more useful things here
 
@@ -405,6 +434,103 @@ def client_time_reserve(cw):
     return cw.timeReserve
 
 
+# Mac Steam mvmmoclient field offsets (from WorldView::updateOffsets /
+# ClientWorld::getObjs / handleCreatePlayer). generated.h is short by 16
+# bytes in WorldView, so wv.offset is not at 0xbc there.
+_MAC_WV_OFFSET = 0xbc
+_MAC_CW_SERVER = 0x498
+_MAC_CW_MYSUB = 0x4e0
+_MAC_CW_PLAYER = 0x4f0
+
+
+def view_offset(wv):
+    '''Camera top-left in world pixels.'''
+    if wv == ffi.NULL:
+        return 0, 0
+    if platform.system() == 'Darwin':
+        xy = ffi.cast('int32_t *', int(ffi.cast('uintptr_t', wv)) + _MAC_WV_OFFSET)
+        return int(xy[0]), int(xy[1])
+    return int(wv.offset.x), int(wv.offset.y)
+
+
+def is_player_class(cname):
+    if cname in refs.CASTABLE.get('PlayerCharacter', ()):
+        return True
+    if cname in refs.CASTABLE.get('Player', ()):
+        return True
+    return False
+
+
+def player_ptr(cw):
+    '''ClientWorld.player, using the Mac field offset when layouts diverge.'''
+    if cw == ffi.NULL:
+        return ffi.NULL
+    if platform.system() == 'Darwin':
+        plr = _mac_load_ptr(cw, _MAC_CW_PLAYER, 'struct PlayerCharacter *')
+        if plr != ffi.NULL:
+            return plr
+    plr = cw.player
+    if plr == ffi.NULL or not _ptr_mapped(plr, 0x100):
+        return ffi.NULL
+    return ffi.cast('struct PlayerCharacter *', plr)
+
+
+def player_looks_alive(plr):
+    '''Reject stale/garbage player pointers (zone-join UAF).'''
+    if plr == ffi.NULL or not _ptr_mapped(plr, 0x100):
+        return False
+    try:
+        p = ffi.cast('struct WorldObject *', plr).props
+        if p.wmp <= 0 or p.hmp <= 0:
+            return False
+        if p.wmp > 1024 * 256 or p.hmp > 1024 * 256:
+            return False
+        if p.maxhitpoints <= 0 or p.maxhitpoints > 10000:
+            return False
+        if p.hitpoints < 0 or p.hitpoints > p.maxhitpoints + 100:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def collect_objects(cw):
+    if cw == ffi.NULL:
+        return []
+    sw = cw.serverSubWorld
+    my = cw.mySubWorld
+    if platform.system() == 'Darwin':
+        mac_sw = _mac_load_ptr(cw, _MAC_CW_SERVER, 'struct ForeignSubWorld *')
+        if mac_sw != ffi.NULL:
+            sw = mac_sw
+        mac_my = _mac_load_ptr(cw, _MAC_CW_MYSUB, 'struct ClientSubWorld *')
+        if mac_my != ffi.NULL:
+            my = mac_my
+    out = worldobjects(sw)
+    if my != ffi.NULL:
+        out += worldobjects(ffi.addressof(my.asNativeSubWorld))
+    out += vec2list(cw.allies, 'struct WorldObject *')
+    return out
+
+
+def find_player(cw, objects=None):
+    if cw == ffi.NULL:
+        return ffi.NULL
+    plr = player_ptr(cw)
+    if player_looks_alive(plr):
+        return plr
+    return ffi.NULL
+
+
+def _mac_load_ptr(obj, off, typename):
+    if obj == ffi.NULL:
+        return ffi.NULL
+    p = ffi.cast('void **', int(ffi.cast('uintptr_t', obj)) + off)[0]
+    if not _ptr_mapped(p, 8):
+        return ffi.NULL
+    return ffi.cast(typename, p)
+
+
 def veclen(vector, itemtype='void*'):
     if not _ptr_ok(vector.start) or not _ptr_ok(vector.finish):
         return 0
@@ -424,6 +550,9 @@ def vec2list(vector, itemtype='void*'):
         return []
     if n > 256:
         n = 256
+    nbytes = n * ffi.sizeof(itemtype)
+    if nbytes <= 0 or not _ptr_mapped(vector.start, nbytes):
+        return []
     return ffi.unpack(ffi.cast(itemtype + '*', vector.start), n)
 
 
@@ -440,6 +569,10 @@ def sVecMap2list(svecmap, itemtype='void*'):
 
 def worldobjects(subworld):
     '''get objects from a member of subclass of SubWorldImpl as a list'''
+    if subworld == ffi.NULL:
+        return []
+    if ffi.typeof(subworld).kind != 'pointer':
+        subworld = ffi.addressof(subworld)
     if not _ptr_ok(subworld):
         return []
     return sVecMap2list(subworld.asSubWorldImpl.objs, 'struct WorldObject *')
@@ -448,6 +581,8 @@ def worldobjects(subworld):
 def _ptr_ok(ptr):
     if ptr == ffi.NULL:
         return False
+    if ffi.typeof(ptr).kind != 'pointer':
+        return True
     addr = int(ffi.cast('uintptr_t', ptr))
     sysname = platform.system()
     if sysname == 'Darwin':
@@ -455,6 +590,38 @@ def _ptr_ok(ptr):
     if sysname == 'Linux':
         return addr % 8 == 0 and 0x400000 <= addr <= 0x7fffffffffff
     return addr >= 0x10000
+
+
+_libc = None
+_PAGESIZE = 4096
+
+
+def _ptr_mapped(ptr, nbytes=8):
+    '''True if [ptr, ptr+nbytes) is in a mapped page. Avoids SIGSEGV on Mac.'''
+    if not _ptr_ok(ptr):
+        return False
+    sysname = platform.system()
+    if sysname not in ('Darwin', 'Linux'):
+        return True
+    global _libc
+    if _libc is None:
+        import ctypes
+        import ctypes.util
+        name = ctypes.util.find_library('c')
+        _libc = ctypes.CDLL(name, use_errno=True)
+        _libc.mincore.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        _libc.mincore.restype = ctypes.c_int
+    import ctypes
+    addr = int(ffi.cast('uintptr_t', ptr))
+    end = addr + int(nbytes)
+    vec = ctypes.create_string_buffer(1)
+    page = addr & ~(_PAGESIZE - 1)
+    while page < end:
+        if _libc.mincore(page, _PAGESIZE, vec) != 0:
+            return False
+        page += _PAGESIZE
+    return True
 
 
 def _game_image_range():
@@ -471,17 +638,11 @@ def _game_image_range():
 def _in_game_image(ptr):
     if not _ptr_ok(ptr):
         return False
+    if platform.system() != 'Darwin':
+        return True
     addr = int(ffi.cast('uintptr_t', ptr))
     lo, hi = _game_image_range()
     return lo <= addr < hi
-
-
-def _typed_ptr(ptr, classname):
-    if not _ptr_ok(ptr):
-        return ffi.NULL
-    if getClassName(ptr) != classname:
-        return ffi.NULL
-    return ffi.cast('struct {} *'.format(classname), ptr)
 
 
 def _is_container(cname):
@@ -517,9 +678,9 @@ def _log_world_bind():
     _log_world_bind._last = key
     logging.info(
         'world bind WC=%s CW=%s WV=%s',
-        getClassName(refs.WorldClient) if refs.WorldClient != ffi.NULL else 'NULL',
-        getClassName(refs.ClientWorld) if refs.ClientWorld != ffi.NULL else 'NULL',
-        getClassName(refs.WorldView) if refs.WorldView != ffi.NULL else 'NULL',
+        'WorldClient' if refs.WorldClient != ffi.NULL else 'NULL',
+        'ClientWorld' if refs.ClientWorld != ffi.NULL else 'NULL',
+        'WorldView' if refs.WorldView != ffi.NULL else 'NULL',
     )
 
 
@@ -530,21 +691,31 @@ def getClassName(obj):
     '''
     if obj == ffi.NULL:
         return 'NULL'
-    if not _ptr_ok(obj):
+    ptrsz = ffi.sizeof('void *')
+    if not _ptr_mapped(obj, ptrsz):
         return 'UNKNOWN'
 
     # class pointer is always at [0]
     classptr = ffi.cast('void****', obj)[0]
     if not _in_game_image(classptr):
         return 'UNKNOWN'
+    typeinfo_slot = ffi.cast('void *', int(ffi.cast('uintptr_t', classptr)) - ptrsz)
+    if not _ptr_mapped(typeinfo_slot, ptrsz):
+        return 'UNKNOWN'
     typeinfo = classptr[-1]
     if not _in_game_image(typeinfo):
         return 'UNKNOWN'
-    nameptr = typeinfo[1]
-    if not _ptr_ok(nameptr):
+    if not _ptr_mapped(typeinfo, 2 * ptrsz):
         return 'UNKNOWN'
-    cname = ffi.string(ffi.cast('char*', nameptr), 100)
-    return cname[1 if len(cname) < 11 else 2:].decode()
+    nameptr = typeinfo[1]
+    if not _ptr_mapped(nameptr, 64):
+        return 'UNKNOWN'
+    raw = bytes(ffi.buffer(nameptr, 64))
+    n = raw.find(b'\x00')
+    if n < 2:
+        return 'UNKNOWN'
+    cname = raw[:n]
+    return cname[1 if len(cname) < 11 else 2:].decode('ascii', errors='replace')
 
 
 def firstChild(obj):

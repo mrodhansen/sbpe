@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import sys
 import time
 
 # installed
@@ -173,6 +174,7 @@ def makeSheet(size, sprites, coords, level, maxlevel, tboxes):
 
 def doPack(params):
     name, bpbname, sheetnames, mipmaps = params
+    outdir = os.path.dirname(os.path.abspath(bpbname)) or os.getcwd()
 
     logging.basicConfig(level=logging.INFO)
     logging.getLogger().handlers[0].setFormatter(
@@ -235,7 +237,7 @@ def doPack(params):
         for level in range(mipmaps + 1):
             s = makeSheet(sheetsize, sprites, packed[i], level, mipmaps, tboxes)
 
-            fname = '{}.m{}.{}.png'.format(name, level, i)
+            fname = os.path.join(outdir, '{}.m{}.{}.png'.format(name, level, i))
             logging.info(fname)
             try:
                 s.save(fname)
@@ -301,7 +303,7 @@ def doPack(params):
 
     # write file
 
-    descname = '{}.m.bpb'.format(name)
+    descname = os.path.join(outdir, '{}.m.bpb'.format(name))
     try:
         with open(descname, 'wb') as f:
             f.write(pb.SerializeToString())
@@ -370,20 +372,27 @@ def main(outdir, mipmaps):
         logging.info('please wait, updating: {}...'.format(
             ', '.join(jobs.keys())))
 
-        executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=min(len(jobs), os.cpu_count() or 1))
+        # ProcessPool on macOS spawn() does not inherit os.chdir, so packs
+        # used to land in the repo cwd and dataVersion.m.bpb pointed at
+        # missing files — the game then abort()s on launch.
+        if sys.platform == 'darwin':
+            for pname in jobs:
+                plens[pname] = doPack(jobs[pname])
+                logging.info('done: {}'.format(pname))
+        else:
+            executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=min(len(jobs), os.cpu_count() or 1))
 
-        for pname in jobs:
-            future = executor.submit(doPack, jobs[pname])
-            fnames[future] = pname
+            for pname in jobs:
+                future = executor.submit(doPack, jobs[pname])
+                fnames[future] = pname
 
-        # wait for everything to finish
-        for future in concurrent.futures.as_completed(fnames):
-            pname = fnames[future]
-            plens[pname] = future.result()
-            logging.info('done: {}'.format(pname))
+            for future in concurrent.futures.as_completed(fnames):
+                pname = fnames[future]
+                plens[pname] = future.result()
+                logging.info('done: {}'.format(pname))
 
-        executor.shutdown()
+            executor.shutdown()
     else:
         logging.info('all mipmaps are up to date')
 

@@ -299,15 +299,23 @@ def runLoader(exepath=''):
 
     # generate mipmaps if needed
     if mipmaps:
-        logging.info('checking mipmaps...')
-
+        logging.info('checking mipmaps in %s ...', tdir)
+        if not os.path.isdir(tdir):
+            logging.error('texture dir missing: %s', tdir)
+            return False
         import genmipmaps
         genmipmaps.BASEPATH = tdir
         mn = conf.getint('general', 'mipmap_maxlevel', fallback=2)
-        genmipmaps.main(tdir, mipmaps=mn)
-
-    # overwrite dataVersion
-    if mipmaps:
+        try:
+            genmipmaps.main(tdir, mipmaps=mn)
+        except Exception:
+            logging.exception('mipmap generation failed')
+            shutil.copy(dvbak, dvpath)
+            return False
+        if not os.path.isfile(dvmpath):
+            logging.error('missing %s after generation', dvmpath)
+            shutil.copy(dvbak, dvpath)
+            return False
         shutil.copy(dvmpath, dvpath)
 
     # remove old log

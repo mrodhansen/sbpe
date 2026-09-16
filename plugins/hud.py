@@ -1,8 +1,21 @@
+import logging
 import math
+import platform
+import time
 
 from _remote import ffi, lib
 from manager import PluginBase
 import util
+
+
+def _view_offset(wv):
+    fn = getattr(util, 'view_offset', None)
+    if fn is not None:
+        return fn(wv)
+    if platform.system() == 'Darwin':
+        xy = ffi.cast('int32_t *', int(ffi.cast('uintptr_t', wv)) + 0xbc)
+        return int(xy[0]), int(xy[1])
+    return int(wv.offset.x), int(wv.offset.y)
 
 ELEMS = 'hp hpmax ammo ammomax currency'.split()
 
@@ -35,7 +48,7 @@ class Plugin(PluginBase):
         })
 
         for name in ELEMS:
-            setattr(self, 'txt_' + name, util.PlainText(font='HemiHeadBold'))
+            setattr(self, 'txt_' + name, util.PlainText(font='TenbyFive'))
 
         self.draw = False
 
@@ -43,10 +56,18 @@ class Plugin(PluginBase):
         self.draw = False
         wc = self.refs.WorldClient
         cw = self.refs.ClientWorld
-        player = self.refs.player
-        if player == ffi.NULL and cw != ffi.NULL:
-            player = cw.player
+        player = util.find_player(cw) if cw != ffi.NULL else ffi.NULL
+        if player == ffi.NULL:
+            player = self.refs.player
+        if not util.player_looks_alive(player):
+            player = ffi.NULL
         if wc == ffi.NULL or cw == ffi.NULL or player == ffi.NULL:
+            now = time.perf_counter()
+            if now - getattr(self, '_lastlog', 0) > 5:
+                self._lastlog = now
+                logging.info(
+                    'hud skip wc=%s cw=%s player=%s',
+                    wc != ffi.NULL, cw != ffi.NULL, player != ffi.NULL)
             return
 
         hud = self.refs.HUD
@@ -55,24 +76,31 @@ class Plugin(PluginBase):
         if hud != ffi.NULL and hud.hudStatus != ffi.NULL:
             ffi.cast('struct UIElement *', hud.hudStatus).show = False
 
-        ptype = util.getClassName(player)
-        if ptype not in self.refs.CASTABLE['PlayerCharacter']:
-            return
-
         wobj = ffi.cast('struct WorldObject *', player)
         pc = ffi.cast('struct PlayerCharacter *', player)
 
         self.txt_hp.text = '{}'.format(wobj.props.hitpoints)
         self.txt_hpmax.text = '/{}'.format(wobj.props.maxhitpoints)
 
-        self.txt_ammo.text = '{}'.format(pc.ammo)
-        maxammo = pc.maxAmmo.base + pc.maxAmmo.bonus
-        if pc.ammoMult > 1:
-            self.txt_ammomax.text = '/{} (x{})'.format(maxammo, pc.ammoMult)
+        try:
+            ammo = int(pc.ammo)
+            maxammo = int(pc.maxAmmo.base) + int(pc.maxAmmo.bonus)
+            ammomult = int(pc.ammoMult)
+            ec = int(pc.ec)
+            uc = int(pc.uc)
+        except Exception:
+            logging.exception('hud player stats')
+            return
+        if ammo < 0 or ammo > 99999 or maxammo < 0 or maxammo > 99999:
+            return
+
+        self.txt_ammo.text = '{}'.format(ammo)
+        if ammomult > 1:
+            self.txt_ammomax.text = '/{} (x{})'.format(maxammo, ammomult)
         else:
             self.txt_ammomax.text = '/{}'.format(maxammo)
 
-        self.txt_currency.text = '{} EC  {} UC'.format(pc.ec, pc.uc)
+        self.txt_currency.text = '{} EC  {} UC'.format(ec, uc)
 
         for name in ELEMS:
             el = getattr(self, 'txt_' + name)
@@ -88,6 +116,14 @@ class Plugin(PluginBase):
         self.txt_currency.color = self.config.color_currency
 
         self.draw = True
+        now = time.perf_counter()
+        if now - getattr(self, '_lastlog', 0) > 5:
+            self._lastlog = now
+            logging.info(
+                'hud draw hp=%s/%s ammo=%s xmp=%s ymp=%s tex=%s',
+                wobj.props.hitpoints, wobj.props.maxhitpoints,
+                ammo, wobj.props.xmp, wobj.props.ymp,
+                self.txt_hp._texture)
 
     def onPresent(self):
         if not self.draw:
@@ -112,15 +148,15 @@ class Plugin(PluginBase):
         # hp bar
         wv = self.refs.WorldView
         cw = self.refs.ClientWorld
-        player = self.refs.player
-        if player == ffi.NULL and cw != ffi.NULL:
-            player = cw.player
-        if wv == ffi.NULL or player == ffi.NULL:
+        player = util.find_player(cw) if cw != ffi.NULL else self.refs.player
+        if wv == ffi.NULL or not util.player_looks_alive(player):
             return
         player = ffi.cast('struct WorldObject *', player)
         props = player.props
-        hp = props.hitpoints
-        maxhp = props.maxhitpoints
+        hp = int(props.hitpoints)
+        maxhp = int(props.maxhitpoints)
+        if maxhp <= 0 or hp < 0:
+            return
 
         width = self.config.bar_width
         if width < 0:
@@ -129,21 +165,24 @@ class Plugin(PluginBase):
             bw = width
         bh = self.config.bar_height
 
-        if bw <= 0 or bh <= 0:
+        if bw <= 0 or bh <= 0 or bw > 2000:
             return
 
-        x = props.xmp // 256 + props.wmp // 512 - wv.offset.x
-        y = props.ymp // 256 - wv.offset.y
-
-        # window space coords
-        x = round(x / self.refs.scaleX)
-        y = round(y / self.refs.scaleY)
-        bx = x - bw // 2
-        by = y - bh - self.config.bar_y
-        cw = self.refs.canvasW_[0]
-        ch = self.refs.canvasH_[0]
+        ox, oy = _view_offset(wv)
+        x = (props.xmp // 256 + props.wmp // 512 - ox) / self.refs.scaleX
+        y = (props.ymp // 256 - oy) / self.refs.scaleY
+        bx = int(x - bw // 2)
+        by = int(y - bh - self.config.bar_y)
+        _cw = self.refs.canvasW_[0]
+        _ch = self.refs.canvasH_[0]
         self.refs.canvasW_[0] = self.refs.windowW
         self.refs.canvasH_[0] = self.refs.windowH
+        now = time.perf_counter()
+        if now - getattr(self, '_barlog', 0) > 5:
+            self._barlog = now
+            logging.info(
+                'hud bar bx=%s by=%s bw=%s bh=%s ox=%s oy=%s xmp=%s ymp=%s',
+                bx, by, bw, bh, ox, oy, props.xmp, props.ymp)
 
         # outline
         self.refs.XDL_FillRect(
@@ -153,22 +192,24 @@ class Plugin(PluginBase):
         self.refs.XDL_FillRect(
             bx, by, bw, bh, self.config.bar_background, lib.BLENDMODE_BLEND)
         # bar
-        filled = math.ceil(hp * bw / maxhp)
+        filled = int(math.ceil(hp * bw / maxhp))
+        if filled < 0:
+            filled = 0
+        if filled > bw:
+            filled = bw
         self.refs.XDL_FillRect(
             bx, by, filled, bh, self.config.bar_color, lib.BLENDMODE_BLEND)
         # notches
         st = 1
-        while True:
+        while st * 25 < maxhp:
             cx = bx + round(bw * (maxhp - st * 25) / maxhp)
             if cx <= bx + filled:
                 break
             self.refs.XDL_FillRect(
                 cx, by, 1, bh, self.config.bar_notches, lib.BLENDMODE_BLEND)
             st += 1
-
-        # restore coords
-        self.refs.canvasW_[0] = cw
-        self.refs.canvasH_[0] = ch
+        self.refs.canvasW_[0] = _cw
+        self.refs.canvasH_[0] = _ch
 
     def __del__(self):
         wc = self.refs.WorldClient

@@ -1,5 +1,6 @@
 import time
 import array
+import logging
 
 from _remote import ffi, lib
 from manager import PluginBase
@@ -17,14 +18,23 @@ class Plugin(PluginBase):
 
         self.times = array.array('d')
         self.lastupd = self.prevt = time.perf_counter()
-        self.txt = util.PlainText(font='HemiHeadBold')
-        self.res = util.PlainText(font='HemiHeadBold')
+        self.txt = util.PlainText(font='TenbyFive')
+        self.res = util.PlainText(font='TenbyFive')
         self._oldres = 0
+        self._logged = False
 
     def onPresent(self):
         t = time.perf_counter()
         self.times.append(t - self.prevt)
         self.prevt = t
+
+        if not self._logged:
+            self._logged = True
+            logging.info(
+                'fps present window=%dx%d canvas=%dx%d scale=%.3f tex=%s',
+                self.refs.windowW, self.refs.windowH,
+                self.refs.canvasW_[0], self.refs.canvasH_[0],
+                self.refs.scaleX, self.txt._texture)
 
         if t >= self.lastupd + self.config.update:
             self.lastupd = t

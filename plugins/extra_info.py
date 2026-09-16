@@ -1,10 +1,22 @@
 import logging
 import math
+import platform
 import time
 
 from _remote import ffi, lib
 from manager import PluginBase
 import util
+
+
+def _view_offset(wv):
+    fn = getattr(util, 'view_offset', None)
+    if fn is not None:
+        return fn(wv)
+    if platform.system() == 'Darwin':
+        xy = ffi.cast('int32_t *', int(ffi.cast('uintptr_t', wv)) + 0xbc)
+        return int(xy[0]), int(xy[1])
+    return int(wv.offset.x), int(wv.offset.y)
+
 
 TARGETS = {
     'door': '''
@@ -58,7 +70,7 @@ for k in TARGETS:
         TVIDMAP[vid] = k
 
 BOOSTS = {
-    # vid : (PlayerCharacter attribute, CharacterDescription attribute)
+    # vid prefix : (PlayerCharacter StatVal field, CharacterDescription list)
     'loot-maxhealth': ('maxHitpoints', 'maxhitpoints'),
     'loot-maxammo': ('maxAmmo', 'maxammo'),
     'loot-damage': ('damageBonus', 'damagebonus'),
@@ -68,6 +80,100 @@ BOOSTS = {
     'loot-critchance': ('critChance', 'critchance'),
     'loot-critmult': ('critMult', 'critmult'),
 }
+
+# Mac offsets from PlayerCharacter::mk in mvmmoclient (CFFI Player is short).
+_MAC_PC_CHARDESC = 0x278
+_MAC_PC_STAT_BASE = {
+    'maxHitpoints': 0x2c4,
+    'maxAmmo': 0x2cc,
+    'damageBonus': 0x2dc,
+    'armor': 0x2e4,
+    'walkSpeed': 0x2ec,
+    'jumpSpeed': 0x2f4,
+    'critChance': 0x2fc,
+    'critMult': 0x304,
+}
+_MAC_DESC_REPEATED = {
+    'maxhitpoints': 0x28,
+    'maxammo': 0x38,
+    'damagebonus': 0x48,
+    'armor': 0x60,
+    'walkspeed': 0x70,
+    'jumpspeed': 0x80,
+    'critchance': 0x90,
+    'critmult': 0xa0,
+}
+
+
+def _boost_key(vid):
+    if not vid:
+        return None, 0
+    if vid in BOOSTS:
+        return vid, 1
+    if vid[-1].isdigit() and vid[:-1] in BOOSTS:
+        return vid[:-1], int(vid[-1])
+    return None, 0
+
+
+def _as_pc(plr):
+    if plr == ffi.NULL:
+        return ffi.NULL
+    return ffi.cast('struct PlayerCharacter *', plr)
+
+
+def _i32_at(obj, off):
+    return int(ffi.cast('int32_t *', int(ffi.cast('uintptr_t', obj)) + off)[0])
+
+
+def _ptr_at(obj, off):
+    return ffi.cast('void **', int(ffi.cast('uintptr_t', obj)) + off)[0]
+
+
+def _repeated_ints(desc, field_off):
+    base = int(ffi.cast('uintptr_t', desc)) + field_off
+    raw = ffi.cast('void *', base)
+    if not util._ptr_mapped(raw, 16):
+        return None
+    elems = ffi.cast('int32_t **', raw)[0]
+    n = int(ffi.cast('int32_t *', base + 8)[0])
+    if n <= 0 or n > 32 or elems == ffi.NULL:
+        return None
+    if not util._ptr_mapped(elems, n * 4):
+        return None
+    return list(ffi.unpack(elems, n))
+
+
+def _boost_state(plr, bkey):
+    '''(current base, upgrade table) for a boost vid prefix.'''
+    field, desc_field = BOOSTS[bkey]
+    if platform.system() == 'Darwin':
+        if not util._ptr_mapped(plr, 0x310):
+            return None, None
+        curr = _i32_at(plr, _MAC_PC_STAT_BASE[field])
+        desc = _ptr_at(plr, _MAC_PC_CHARDESC)
+        if desc == ffi.NULL or not util._ptr_mapped(desc, 0xb0):
+            return curr, None
+        return curr, _repeated_ints(desc, _MAC_DESC_REPEATED[desc_field])
+    pc = _as_pc(plr)
+    curr = int(getattr(pc, field).base)
+    desc = pc.charDesc
+    if desc == ffi.NULL:
+        return curr, None
+    mfield = getattr(desc, desc_field)
+    n = int(mfield.current_size)
+    if n <= 0 or n > 32 or mfield.elements == ffi.NULL:
+        return curr, None
+    return curr, list(ffi.unpack(mfield.elements, n))
+
+
+def _boost_needed(plr, bkey, blevel):
+    curr, mvals = _boost_state(plr, bkey)
+    if mvals is None or blevel < 1:
+        return False, curr, mvals
+    idx = blevel if blevel < len(mvals) else len(mvals) - 1
+    if idx < 1:
+        return False, curr, mvals
+    return mvals[idx] > curr, curr, mvals
 
 OPTS = (
     ('color', 0xffffffff, 'color'),
@@ -101,9 +207,9 @@ class Plugin(PluginBase):
         self.config.option('show_room_id', True, 'bool')
 
         self._initedopts = False
-        self.numbers = util.NumberDict(size=16, color=0xffff80)
-        self.negnumbers = util.NumberDict(size=16, color=0x8080ff)
-        self.roomtxt = util.PlainText(size=16)
+        self.numbers = util.NumberDict(size=16, color=0xffff80, font=b'TenbyFive')
+        self.negnumbers = util.NumberDict(size=16, color=0x8080ff, font=b'TenbyFive')
+        self.roomtxt = util.PlainText(size=16, font=b'TenbyFive')
 
     def onPresent(self):
         if not self._initedopts:
@@ -119,33 +225,65 @@ class Plugin(PluginBase):
         if cw == ffi.NULL or wv == ffi.NULL:
             return
 
-        plr = self.refs.player
+        objects = util.collect_objects(cw)
+        plr = util.find_player(cw)
         if plr == ffi.NULL:
-            plr = cw.player
-        if plr == ffi.NULL:
-            return
-        if util.getClassName(plr) not in self.refs.CASTABLE['PlayerCharacter']:
-            return
-        plr = ffi.cast('struct PlayerCharacter *', plr)
+            plr = self.refs.player if util.player_looks_alive(self.refs.player) else ffi.NULL
+        pc = _as_pc(plr) if util.player_looks_alive(plr) else ffi.NULL
+        if pc == ffi.NULL:
+            plr = ffi.NULL
+        ox, oy = _view_offset(wv)
+        pclass = 'ok' if plr != ffi.NULL else 'NULL'
+        now = time.perf_counter()
+        if not getattr(self, '_logged', False) or now - getattr(self, '_lastlog', 0) > 5:
+            self._logged = True
+            self._lastlog = now
+            self._need_counts = True
+            samples = []
+            loot = []
+            for obj in objects:
+                try:
+                    vid = util.getstr(obj.props.vid)
+                except Exception as exc:
+                    samples.append('err:{}'.format(exc))
+                    continue
+                if len(samples) < 12:
+                    samples.append(vid)
+                if vid.startswith('loot-') or vid in TVIDMAP or _boost_key(vid)[0]:
+                    loot.append(vid)
+            php = px = py = None
+            if plr != ffi.NULL:
+                try:
+                    pr = ffi.cast('struct WorldObject *', plr).props
+                    php, px, py = int(pr.hitpoints), int(pr.xmp), int(pr.ymp)
+                except Exception as exc:
+                    samples.append('plr_props:{}'.format(exc))
+            logging.info(
+                'extra_info plr=%s pclass=%s hp=%s xmp=%s ymp=%s '
+                'objs=%d offset=%d,%d arrows=%r show_hp=%s loot=%s samples=%s',
+                plr != ffi.NULL, pclass, php, px, py,
+                len(objects), ox, oy, self.config.arrows,
+                self.config.show_hp, loot[:20], samples)
 
-        sw = self.refs.serverSubWorld
-        if sw == ffi.NULL:
-            sw = cw.serverSubWorld
-        objects = util.worldobjects(sw)
-        if util._ptr_ok(cw.mySubWorld):
-            objects += util.worldobjects(cw.mySubWorld.asNativeSubWorld)
-        objects += util.vec2list(cw.allies, 'struct WorldObject *')
-
+        # UNKNOWN class still has a usable WorldObject; do not abort.
         kinds = self.config.arrows.split()
+        n_vid = n_arrow = n_hp = n_use = n_trig = 0
+        n_kind = {}
 
         for obj in objects:
-            p = obj.props
-            vid = util.getstr(p.vid)
+            try:
+                p = obj.props
+                vid = util.getstr(p.vid)
+            except Exception:
+                continue
+            if vid and vid != '(NULL)':
+                n_vid += 1
 
             # invisible
-            if len(vid) == 0:
+            if len(vid) == 0 or vid == '(NULL)':
                 # triggers
                 if p.trigger != 0:
+                    n_trig += 1
                     self.drawFrame(
                         obj, self.config.trigger_color,
                         self.config.trigger_frame)
@@ -154,49 +292,50 @@ class Plugin(PluginBase):
 
             w2 = p.wmp // 512
             h2 = p.hmp // 512
-            x = p.xmp // 256 + w2 - wv.offset.x
-            y = p.ymp // 256 + h2 - wv.offset.y
+            x = p.xmp // 256 + w2 - ox
+            y = p.ymp // 256 + h2 - oy
             inbounds = x + w2 > 0 and y + h2 > 0 and\
                 x - w2 < self.refs.canvasW_[0] and\
                 y - h2 < self.refs.canvasH_[0]
 
-            # object hp/armor
+            # object hp/armor — skip walls/garbage (hitpoints often 0 or huge)
             if inbounds and self.config.show_hp:
-                if p.hitpoints >= 0:
-                    self.numbers.draw(
-                        p.hitpoints, x, y, anchorX=0.5, anchorY=1)
-                elif p.hitpoints != -1:
-                    self.negnumbers.draw(
-                        abs(p.hitpoints), x, y, anchorX=0.5, anchorY=1)
-
-                if p.armor > 0:
-                    self.numbers.draw(p.armor, x, y, anchorX=0.5, anchorY=0)
+                hp = int(p.hitpoints)
+                if 0 <= hp <= 9999:
+                    n_hp += 1
+                    self.numbers.draw(hp, x, y, anchorX=0.5, anchorY=1)
+                elif -9999 <= hp <= -2:
+                    n_hp += 1
+                    self.negnumbers.draw(-hp, x, y, anchorX=0.5, anchorY=1)
+                armor = int(p.armor)
+                if 0 < armor <= 9999:
+                    self.numbers.draw(armor, x, y, anchorX=0.5, anchorY=0)
 
             # use counts
             if inbounds and self.config.show_uses and p.interact != 0:
                 idesc = p.interactdescription
-                if idesc != ffi.NULL and idesc.numused > 0 and\
-                        idesc.totaluses > 0:
+                if idesc != ffi.NULL and util._ptr_mapped(idesc, 16) and \
+                        idesc.numused > 0 and idesc.totaluses > 0:
+                    n_use += 1
                     self.numbers.draw(
                         idesc.numused, x, y, anchorX=0.5, anchorY=0.5)
 
-            # boosts
-            if 'boost' in kinds and vid[:-1] in BOOSTS:
-                btype = BOOSTS[vid[:-1]]
-                blevel = int(vid[-1])
-
-                # current value: StatVal from PlayerCharacter
-                currvalue = getattr(plr, btype[0]).base
-
-                # max values list: RepeatedField_int from CharacterDescription
-                mvals = getattr(plr.charDesc, btype[1])
-                mvals = ffi.unpack(mvals.elements, mvals.current_size)
-
-                for i in range(1, len(mvals)):
-                    if mvals[i] > currvalue and i <= blevel:
-                        self.drawArrow(plr, obj, 'boost')
-                        break
-
+            # boosts — only if this drop upgrades a stat we don't already have
+            bkey, blevel = _boost_key(vid)
+            if 'boost' in kinds and bkey is not None:
+                if plr != ffi.NULL:
+                    try:
+                        need, curr, mvals = _boost_needed(plr, bkey, blevel)
+                        if getattr(self, '_need_counts', False):
+                            logging.info(
+                                'boost %s lv=%s need=%s curr=%s table=%s',
+                                vid, blevel, need, curr, mvals)
+                        if need:
+                            n_arrow += 1
+                            n_kind['boost'] = n_kind.get('boost', 0) + 1
+                            self.drawArrow(plr, obj, 'boost')
+                    except Exception:
+                        logging.exception('boost %s', vid)
                 continue
 
             # match vid name with target list
@@ -210,13 +349,23 @@ class Plugin(PluginBase):
                 continue
 
             # do we need hp?
-            if k == 'hp':
+            if k == 'hp' and plr != ffi.NULL:
                 plrprops = ffi.cast('struct WorldObject *', plr).props
                 if plrprops.hitpoints == plrprops.maxhitpoints:
                     continue
 
             # all checks passed, we are interested in this obj
+            if plr == ffi.NULL:
+                continue
+            n_arrow += 1
+            n_kind[k] = n_kind.get(k, 0) + 1
             self.drawArrow(plr, obj, k)
+
+        if getattr(self, '_need_counts', False):
+            self._need_counts = False
+            logging.info(
+                'extra_info counts vid=%d hpdraw=%d uses=%d trig=%d arrows=%d by_kind=%s',
+                n_vid, n_hp, n_use, n_trig, n_arrow, n_kind)
 
         # zone/room id
         if self.config.show_room_id:
@@ -232,7 +381,7 @@ class Plugin(PluginBase):
     def drawArrow(self, src, dst, kind):
         optprefix = 'arrow_' + kind + '_'
 
-        offset = self.refs.WorldView.offset
+        ox, oy = _view_offset(self.refs.WorldView)
         cw = self.refs.canvasW_[0]
         ch = self.refs.canvasH_[0]
 
@@ -241,8 +390,8 @@ class Plugin(PluginBase):
 
         dw2 = dp.wmp // 512
         dh2 = dp.hmp // 512
-        x1 = (dp.xmp) // 256 + dw2 - offset.x
-        y1 = (dp.ymp) // 256 + dh2 - offset.y
+        x1 = (dp.xmp) // 256 + dw2 - ox
+        y1 = (dp.ymp) // 256 + dh2 - oy
 
         inbounds = (x1 + dw2 >= 0 and x1 - dw2 <= cw and y1 + dh2 >= 0 and y1 - dh2 <= ch)
 
@@ -250,8 +399,8 @@ class Plugin(PluginBase):
             return
 
         if inbounds:
-            x0 = (sp.xmp + sp.wmp // 2) // 256 - offset.x
-            y0 = (sp.ymp + sp.hmp // 2) // 256 - offset.y
+            x0 = (sp.xmp + sp.wmp // 2) // 256 - ox
+            y0 = (sp.ymp + sp.hmp // 2) // 256 - oy
         else:
             x0 = cw // 2
             y0 = ch // 2
@@ -326,9 +475,9 @@ class Plugin(PluginBase):
 
         blend = lib.BLENDMODE_ADD
         p = obj.props
-        wv = self.refs.WorldView
-        x = p.xmp // 256 - wv.offset.x
-        y = p.ymp // 256 - wv.offset.y
+        ox, oy = _view_offset(self.refs.WorldView)
+        x = p.xmp // 256 - ox
+        y = p.ymp // 256 - oy
         w = p.wmp // 256
         h = p.hmp // 256
 

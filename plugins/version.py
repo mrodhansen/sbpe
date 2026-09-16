@@ -14,19 +14,27 @@ class Plugin(PluginBase):
 
     def afterUpdate(self):
         menu = self.refs.MainMenu
-        if menu == ffi.NULL or menu.version == ffi.NULL:
+        if menu == ffi.NULL:
             return
-        menu.version.asUIElement.show = False
         if len(self.vtxt.text) == 0:
-            sbver = util.getstr(menu.version.text)
-            self.vtxt.text = VTEMPLATE.format(sbver, self.refs)
+            sbver = ''
+            if util._ptr_mapped(menu.version):
+                ffi.cast('struct UIElement *', menu.version).show = False
+                sbver = util.getstr(menu.version.text)
+            if sbver and sbver != '(NULL)':
+                self.vtxt.text = VTEMPLATE.format(sbver, self.refs)
+            else:
+                self.vtxt.text = 'SBPE ' + self.refs.VERSION
 
     def onPresent(self):
         if self.refs.MainMenu == ffi.NULL:
             return
+        if len(self.vtxt.text) == 0:
+            self.vtxt.text = 'SBPE ' + self.refs.VERSION
         t = time.perf_counter()
         self.vtxt.alpha = abs(math.sin(t * 2)) * 0.7 + 0.3
-        self.vtxt.draw(4, self.refs.windowH - 4, anchorY=1)
+        y = self.refs.windowH if self.refs.windowH > 0 else 40
+        self.vtxt.draw(4, y - 4, anchorY=1)
 
     def __del__(self):
         menu = self.refs.MainMenu
