@@ -290,7 +290,7 @@ def updateState():
 
     if not types:
         refs.MainMenu = refs.GameClient = refs.WorldClient = refs.ClientWorld =\
-            refs.WorldView = ffi.NULL
+            refs.WorldView = refs.HUD = refs.player = refs.serverSubWorld = ffi.NULL
         return
 
     # main menu
@@ -303,18 +303,32 @@ def updateState():
     # GameClient.worldClient / WorldClient.clientWorld offsets match the Mac
     # binary; following a not-yet-constructed pointer still SIGSEGVs plugins.
     refs.GameClient = refs.WorldClient = refs.ClientWorld =\
-        refs.WorldView = ffi.NULL
+        refs.WorldView = refs.HUD = refs.player = refs.serverSubWorld = ffi.NULL
 
     if types[0] == 'GameClient':
         refs.GameClient = tops[0]
-        wc = _typed_ptr(refs.GameClient.worldClient, 'WorldClient')
-        if wc != ffi.NULL:
+        if platform.system() == 'Darwin':
+            # Do not dereference generated.h nested pointers. A wrong
+            # worldClient/clientWorld value is often 8-byte-aligned and in
+            # _ptr_ok range but unmapped; getClassName then SIGSEGVs.
+            wc = _ui_find(refs.GameClient, 'WorldClient')
             refs.WorldClient = wc
-            cw = _typed_ptr(wc.clientWorld, 'ClientWorld')
-            wv = _typed_ptr(wc.worldView, 'WorldView')
-            if cw != ffi.NULL and wv != ffi.NULL:
-                refs.ClientWorld = cw
-                refs.WorldView = wv
+            if wc != ffi.NULL:
+                refs.WorldView = _ui_find(wc, 'WorldView')
+                refs.HUD = _ui_find(wc, 'HUD')
+            _log_world_bind()
+        else:
+            wc = _typed_ptr(refs.GameClient.worldClient, 'WorldClient')
+            if wc != ffi.NULL:
+                refs.WorldClient = wc
+                cw = _typed_ptr(wc.clientWorld, 'ClientWorld')
+                wv = _typed_ptr(wc.worldView, 'WorldView')
+                if cw != ffi.NULL and wv != ffi.NULL:
+                    refs.ClientWorld = cw
+                    refs.WorldView = wv
+                    refs.player = cw.player
+                    refs.serverSubWorld = cw.serverSubWorld
+                    refs.HUD = wc.hud
 
     # add more useful things here
 
@@ -443,12 +457,70 @@ def _ptr_ok(ptr):
     return addr >= 0x10000
 
 
+def _game_image_range():
+    rng = getattr(_game_image_range, '_rng', None)
+    if rng is not None:
+        return rng
+    slide = int(lib.sbpe_image_slide())
+    base = 0x100000000 + slide
+    rng = (base, base + 0x800000)
+    _game_image_range._rng = rng
+    return rng
+
+
+def _in_game_image(ptr):
+    if not _ptr_ok(ptr):
+        return False
+    addr = int(ffi.cast('uintptr_t', ptr))
+    lo, hi = _game_image_range()
+    return lo <= addr < hi
+
+
 def _typed_ptr(ptr, classname):
     if not _ptr_ok(ptr):
         return ffi.NULL
     if getClassName(ptr) != classname:
         return ffi.NULL
     return ffi.cast('struct {} *'.format(classname), ptr)
+
+
+def _is_container(cname):
+    return cname in refs.CASTABLE.get('UIElementContainer', ())
+
+
+def _ui_find(obj, classname, depth=4):
+    '''Find a named UI object under obj. Used when generated.h offsets miss.'''
+    if obj == ffi.NULL or depth < 0:
+        return ffi.NULL
+    if getClassName(obj) == classname:
+        if classname in STRUCTTYPES:
+            return ffi.cast('struct {} *'.format(classname), obj)
+        return obj
+    if not _is_container(getClassName(obj)):
+        return ffi.NULL
+    uiec = ffi.cast('struct UIElementContainer *', obj)
+    for elem in vec2list(uiec.children):
+        found = _ui_find(elem, classname, depth - 1)
+        if found != ffi.NULL:
+            return found
+    return ffi.NULL
+
+
+def _log_world_bind():
+    key = (
+        refs.WorldClient != ffi.NULL,
+        refs.ClientWorld != ffi.NULL,
+        refs.WorldView != ffi.NULL,
+    )
+    if key == getattr(_log_world_bind, '_last', None):
+        return
+    _log_world_bind._last = key
+    logging.info(
+        'world bind WC=%s CW=%s WV=%s',
+        getClassName(refs.WorldClient) if refs.WorldClient != ffi.NULL else 'NULL',
+        getClassName(refs.ClientWorld) if refs.ClientWorld != ffi.NULL else 'NULL',
+        getClassName(refs.WorldView) if refs.WorldView != ffi.NULL else 'NULL',
+    )
 
 
 def getClassName(obj):
@@ -463,10 +535,10 @@ def getClassName(obj):
 
     # class pointer is always at [0]
     classptr = ffi.cast('void****', obj)[0]
-    if not _ptr_ok(classptr):
+    if not _in_game_image(classptr):
         return 'UNKNOWN'
     typeinfo = classptr[-1]
-    if not _ptr_ok(typeinfo):
+    if not _in_game_image(typeinfo):
         return 'UNKNOWN'
     nameptr = typeinfo[1]
     if not _ptr_ok(nameptr):

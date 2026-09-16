@@ -119,15 +119,21 @@ class Plugin(PluginBase):
         if cw == ffi.NULL or wv == ffi.NULL:
             return
 
-        plr = cw.player
+        plr = self.refs.player
+        if plr == ffi.NULL:
+            plr = cw.player
         if plr == ffi.NULL:
             return
         if util.getClassName(plr) not in self.refs.CASTABLE['PlayerCharacter']:
             return
         plr = ffi.cast('struct PlayerCharacter *', plr)
 
-        objects = util.worldobjects(cw.serverSubWorld)
-        objects += util.worldobjects(cw.mySubWorld.asNativeSubWorld)
+        sw = self.refs.serverSubWorld
+        if sw == ffi.NULL:
+            sw = cw.serverSubWorld
+        objects = util.worldobjects(sw)
+        if util._ptr_ok(cw.mySubWorld):
+            objects += util.worldobjects(cw.mySubWorld.asNativeSubWorld)
         objects += util.vec2list(cw.allies, 'struct WorldObject *')
 
         kinds = self.config.arrows.split()

@@ -43,18 +43,24 @@ class Plugin(PluginBase):
         self.draw = False
         wc = self.refs.WorldClient
         cw = self.refs.ClientWorld
-        if wc == ffi.NULL or cw == ffi.NULL or cw.player == ffi.NULL:
+        player = self.refs.player
+        if player == ffi.NULL and cw != ffi.NULL:
+            player = cw.player
+        if wc == ffi.NULL or cw == ffi.NULL or player == ffi.NULL:
             return
 
-        if wc.hud != ffi.NULL and wc.hud.hudStatus != ffi.NULL:
-            ffi.cast('struct UIElement *', wc.hud.hudStatus).show = False
+        hud = self.refs.HUD
+        if hud == ffi.NULL:
+            hud = wc.hud
+        if hud != ffi.NULL and hud.hudStatus != ffi.NULL:
+            ffi.cast('struct UIElement *', hud.hudStatus).show = False
 
-        ptype = util.getClassName(cw.player)
+        ptype = util.getClassName(player)
         if ptype not in self.refs.CASTABLE['PlayerCharacter']:
             return
 
-        wobj = ffi.cast('struct WorldObject *', cw.player)
-        pc = ffi.cast('struct PlayerCharacter *', cw.player)
+        wobj = ffi.cast('struct WorldObject *', player)
+        pc = ffi.cast('struct PlayerCharacter *', player)
 
         self.txt_hp.text = '{}'.format(wobj.props.hitpoints)
         self.txt_hpmax.text = '/{}'.format(wobj.props.maxhitpoints)
@@ -106,7 +112,12 @@ class Plugin(PluginBase):
         # hp bar
         wv = self.refs.WorldView
         cw = self.refs.ClientWorld
-        player = ffi.cast('struct WorldObject *', cw.player)
+        player = self.refs.player
+        if player == ffi.NULL and cw != ffi.NULL:
+            player = cw.player
+        if wv == ffi.NULL or player == ffi.NULL:
+            return
+        player = ffi.cast('struct WorldObject *', player)
         props = player.props
         hp = props.hitpoints
         maxhp = props.maxhitpoints
