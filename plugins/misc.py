@@ -1,6 +1,5 @@
 import colorsys
 import logging
-import platform
 import time
 
 from _remote import ffi, lib
@@ -77,11 +76,7 @@ class Plugin(PluginBase):
         gc.sinceKeypress = 0
 
         # reduce background brightness if needed
-        if platform.system() == 'Darwin':
-            if self.config.max_bg_value < 1 and not getattr(self, '_logged_darwin_bg', False):
-                logging.warning('max_bg_value is unsupported on Darwin')
-                self._logged_darwin_bg = True
-        elif self.config.max_bg_value < 1:
+        if self.config.max_bg_value < 1:
             bg = self.refs.stage[0].backgroundColor
             r, g, b = ((bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff)
             h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)

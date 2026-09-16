@@ -76,10 +76,10 @@ def hook_DoEvents():
 def hook_Clear(color):
     util.updateState()
     refs.manager.runCallbacks('afterUpdate')
-    if platform.system() == 'Darwin':
-        ORIGS['XDL_Clear'](color)
-    else:
+    if refs.stage[0] != ffi.NULL:
         ORIGS['XDL_Clear'](refs.stage[0].backgroundColor)
+    else:
+        ORIGS['XDL_Clear'](color)
 
 
 @ffi.def_extern()

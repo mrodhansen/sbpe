@@ -18,8 +18,8 @@
 ## OS support
 
 - Windows: yes (process inject via mayhem)
-- Mac: yes (x86_64 `remote.bin` + `launcher_mac` / DYLD insert; Apple Silicon via Rosetta)
-- Linux: yes (`LD_PRELOAD` + ELF ASLR slide)
+- Mac: yes (x86_64 `remote.bin` + `launcher_mac` / DYLD insert; Apple Silicon via Rosetta). GameClient / WorldClient / ClientWorld / WorldView / HUD / WorldObject.props offsets were checked against the Steam `mvmmoclient` binary. HUD / map / zoom / player list / extra_info run on the same path as Windows; plugins refuse a nested pointer unless its vtable name matches.
+- Linux: yes (`LD_PRELOAD` + ELF ASLR slide). Same 64-bit struct walk as Mac, libstdc++ `std::string`. Not executed against a Linux Steam client in this port.
 
 ## Download
 

@@ -136,6 +136,29 @@ def build():
                 else:
                     repl = 'struct STDString {\n  char *s;\n};'
                 text = text[:block.start()] + repl + text[block.end():]
+            dblock = re.search(r'#ifdef MS_WIN32\nstruct DIterator.*?#endif', text, flags=re.S)
+            if dblock:
+                if platform.system() == 'Windows':
+                    drepl = (
+                        'struct DIterator {\n'
+                        '  int cur;\n  int first;\n  int last;\n  int node;\n'
+                        '};\n'
+                        'struct STDDeque {\n'
+                        '  int map;\n  int mapSize;\n'
+                        '  struct DIterator start;\n  struct DIterator finish;\n'
+                        '};'
+                    )
+                else:
+                    drepl = (
+                        'struct DIterator {\n'
+                        '  void *cur;\n  void *node;\n'
+                        '};\n'
+                        'struct STDDeque {\n'
+                        '  void *map;\n  unsigned long long mapSize;\n'
+                        '  struct DIterator start;\n  struct DIterator finish;\n'
+                        '};'
+                    )
+                text = text[:dblock.start()] + drepl + text[dblock.end():]
         ffibuilder.cdef(text)
     ffibuilder.cdef('long sbpe_image_slide(void);')
     ffibuilder.cdef('int sbpe_image_found(void);')

@@ -293,33 +293,38 @@ def updateState():
             refs.WorldView = ffi.NULL
         return
 
-    # generated.h WorldClient/ClientWorld offsets do not match the Mac client.
-    # Reading them SIGSEGVs in onPresent (fps timeReserve, hud, map, ...).
-    if platform.system() == 'Darwin':
-        refs.MainMenu = refs.GameClient = refs.WorldClient = refs.ClientWorld =\
-            refs.WorldView = ffi.NULL
-        return
-
     # main menu
     if types[0] == 'MainMenu':
         refs.MainMenu = tops[0]
     else:
         refs.MainMenu = ffi.NULL
 
-    # game client
+    # game client — only publish nested pointers after the vtable name matches.
+    # GameClient.worldClient / WorldClient.clientWorld offsets match the Mac
+    # binary; following a not-yet-constructed pointer still SIGSEGVs plugins.
     refs.GameClient = refs.WorldClient = refs.ClientWorld =\
         refs.WorldView = ffi.NULL
 
     if types[0] == 'GameClient':
         refs.GameClient = tops[0]
-        refs.WorldClient = refs.GameClient.worldClient
-        if refs.WorldClient != ffi.NULL:
-            refs.WorldView = refs.WorldClient.worldView
-            refs.ClientWorld = refs.WorldClient.clientWorld
-            if refs.ClientWorld == ffi.NULL or refs.WorldView == ffi.NULL:
-                refs.ClientWorld = refs.WorldView = ffi.NULL
+        wc = _typed_ptr(refs.GameClient.worldClient, 'WorldClient')
+        if wc != ffi.NULL:
+            refs.WorldClient = wc
+            cw = _typed_ptr(wc.clientWorld, 'ClientWorld')
+            wv = _typed_ptr(wc.worldView, 'WorldView')
+            if cw != ffi.NULL and wv != ffi.NULL:
+                refs.ClientWorld = cw
+                refs.WorldView = wv
 
     # add more useful things here
+
+
+def _stdstring_raw(stdstring):
+    if stdstring == ffi.NULL:
+        return ffi.NULL
+    if ffi.typeof(stdstring).kind == 'pointer':
+        return stdstring
+    return ffi.addressof(stdstring)
 
 
 def getstr(stdstring):
@@ -329,36 +334,76 @@ def getstr(stdstring):
         # libc++ std::string (Apple / darwin13 layout): 24-byte SSO.
         # long: byte0 LSB=1, size at +8, data ptr at +16
         # short: byte0 = size<<1, chars at +1
-        if ffi.typeof(stdstring).kind == 'pointer':
-            raw = stdstring
-        else:
-            raw = ffi.addressof(stdstring)
+        raw = _stdstring_raw(stdstring)
+        if not _ptr_ok(raw):
+            return '(NULL)'
         base = ffi.cast('unsigned char *', raw)
         first = int(base[0])
         if first & 1:
             n = int(ffi.cast('uint64_t *', raw)[1])
             ptr = ffi.cast('char **', raw)[2]
+            if not _ptr_ok(ptr) or n > 10000:
+                return '(NULL)'
         else:
             n = first >> 1
+            if n > 22:
+                return '(NULL)'
             ptr = ffi.cast('char *', raw) + 1
         if ptr == ffi.NULL or n > 10000:
             return '(NULL)'
         if n <= 0:
             return ''
         return bytes(ffi.buffer(ptr, n)).decode('utf-8', errors='replace')
+    if not hasattr(stdstring, 's') or stdstring.s == ffi.NULL:
+        return '(NULL)'
+    if not _ptr_ok(stdstring.s):
+        return '(NULL)'
     return ffi.string(stdstring.s, 1000).decode('utf-8', errors='replace')
 
 
+def clear_stdstring(stdstring):
+    '''Zero a std::string length in place (hide_shells / hide_factions).'''
+    if stdstring == ffi.NULL:
+        return
+    if platform.system() == 'Darwin':
+        raw = _stdstring_raw(stdstring)
+        if not _ptr_ok(raw):
+            return
+        base = ffi.cast('unsigned char *', raw)
+        if int(base[0]) & 1:
+            ffi.cast('uint64_t *', raw)[1] = 0
+        else:
+            base[0] = 0
+        return
+    if not hasattr(stdstring, 's') or stdstring.s == ffi.NULL:
+        return
+    if not _ptr_ok(stdstring.s):
+        return
+    ffi.cast('int *', stdstring.s)[-3] = 0
+
+
+def client_time_reserve(cw):
+    '''ClientWorld net-lag buffer. Mac stores the 1000-clamped value at inputBuffer.'''
+    if cw == ffi.NULL:
+        return 0
+    if platform.system() == 'Darwin':
+        return cw.inputBuffer
+    return cw.timeReserve
+
+
 def veclen(vector, itemtype='void*'):
-    if vector.start == ffi.NULL or vector.finish == ffi.NULL:
+    if not _ptr_ok(vector.start) or not _ptr_ok(vector.finish):
+        return 0
+    if vector.finish < vector.start:
         return 0
     return (vector.finish - vector.start) // ffi.sizeof(itemtype)
 
 
 def vec2list(vector, itemtype='void*'):
     '''std::vector -> list'''
-    if vector.start == ffi.NULL or vector.finish == ffi.NULL or\
-            vector.endOfStorage <= vector.start:
+    if not _ptr_ok(vector.start) or not _ptr_ok(vector.finish):
+        return []
+    if vector.endOfStorage < vector.finish or vector.finish < vector.start:
         return []
     n = (vector.finish - vector.start) // ffi.sizeof(itemtype)
     if n <= 0:
@@ -371,14 +416,17 @@ def vec2list(vector, itemtype='void*'):
 def sVecMap2list(svecmap, itemtype='void*'):
     '''struct SortedVecMap -> list'''
     lst = vec2list(svecmap.vec, 'struct SortedVecElement')
-    for i in range(len(lst)):
-        lst[i] = ffi.cast(itemtype, lst[i].obj)
-    return lst
+    out = []
+    for el in lst:
+        if not _ptr_ok(el.obj):
+            continue
+        out.append(ffi.cast(itemtype, el.obj))
+    return out
 
 
 def worldobjects(subworld):
     '''get objects from a member of subclass of SubWorldImpl as a list'''
-    if subworld == ffi.NULL:
+    if not _ptr_ok(subworld):
         return []
     return sVecMap2list(subworld.asSubWorldImpl.objs, 'struct WorldObject *')
 
@@ -386,10 +434,21 @@ def worldobjects(subworld):
 def _ptr_ok(ptr):
     if ptr == ffi.NULL:
         return False
-    if platform.system() != 'Darwin':
-        return True
     addr = int(ffi.cast('uintptr_t', ptr))
-    return 0x100000000 <= addr <= 0x7fffffffffff
+    sysname = platform.system()
+    if sysname == 'Darwin':
+        return addr % 8 == 0 and 0x100000000 <= addr <= 0x7fffffffffff
+    if sysname == 'Linux':
+        return addr % 8 == 0 and 0x400000 <= addr <= 0x7fffffffffff
+    return addr >= 0x10000
+
+
+def _typed_ptr(ptr, classname):
+    if not _ptr_ok(ptr):
+        return ffi.NULL
+    if getClassName(ptr) != classname:
+        return ffi.NULL
+    return ffi.cast('struct {} *'.format(classname), ptr)
 
 
 def getClassName(obj):
@@ -417,12 +476,13 @@ def getClassName(obj):
 
 
 def firstChild(obj):
-    if obj == ffi.NULL:
+    if not _ptr_ok(obj):
         return ffi.NULL
     cv = ffi.cast('struct UIElementContainer *', obj).children
-    if cv.finish == cv.start or cv.endOfStorage <= cv.start:
+    kids = vec2list(cv, 'struct UIElement *')
+    if not kids:
         return ffi.NULL
-    return ffi.cast('struct UIElement **', cv.start)[0]
+    return kids[0]
 
 
 def getUITree(obj, depth=0):

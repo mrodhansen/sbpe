@@ -43,7 +43,10 @@ struct STDUSet {
   struct STDHashtable t;
 };
 
-// std::deque<>::iterator
+// std::deque<>::iterator / std::deque
+// Windows (MSVC 32-bit) keeps the original int layout.
+// Unix 64-bit libc++ / libstdc++: 2-pointer iterator, 48-byte deque.
+#ifdef MS_WIN32
 struct DIterator {
   int cur;
   int first;
@@ -51,13 +54,25 @@ struct DIterator {
   int node;
 };
 
-// std::deque
 struct STDDeque {
   int map;
   int mapSize;
   struct DIterator start;
   struct DIterator finish;
 };
+#else
+struct DIterator {
+  void *cur;
+  void *node;
+};
+
+struct STDDeque {
+  void *map;
+  unsigned long long mapSize;
+  struct DIterator start;
+  struct DIterator finish;
+};
+#endif
 
 // std::function
 struct STDFunction {

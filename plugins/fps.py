@@ -55,7 +55,7 @@ class Plugin(PluginBase):
             self._oldres = 0
             return
 
-        res = cw.timeReserve
+        res = util.client_time_reserve(cw)
 
         self.res.text = 'r:{}'.format(res)
         self.res.size = self.config.res_size
