@@ -36,6 +36,7 @@ static void sbpe_boot(void) {
 	pthread_once(&sbpe_once, sbpe_kickstart_once);
 }
 
+#ifndef __APPLE__
 static int sbpe_SDL_Init(uint32_t flags) {
 	int (*orig)(uint32_t);
 	sbpe_boot();
@@ -45,6 +46,7 @@ static int sbpe_SDL_Init(uint32_t flags) {
 	}
 	return orig(flags);
 }
+#endif
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -52,20 +54,23 @@ static int sbpe_SDL_Init(uint32_t flags) {
 static int sbpe_slide_found;
 static long sbpe_slide_value;
 
-__attribute__((constructor))
-static void sbpe_ctor(void) {
-	unsetenv("DYLD_INSERT_LIBRARIES");
-	unsetenv("DYLD_FORCE_FLAT_NAMESPACE");
+static void *sbpe_deferred_boot(void *arg) {
+	(void)arg;
+	sbpe_boot();
+	return NULL;
 }
 
-#define DYLD_INTERPOSE(_replacement, _replacee) \
-	__attribute__((used)) static struct { const void *replacement; const void *replacee; } \
-	_interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = { \
-		(const void *)(unsigned long)&_replacement, \
-		(const void *)(unsigned long)&_replacee \
-	};
-
-DYLD_INTERPOSE(sbpe_SDL_Init, SDL_Init)
+__attribute__((constructor))
+static void sbpe_ctor(void) {
+	pthread_t t;
+	unsetenv("DYLD_INSERT_LIBRARIES");
+	unsetenv("DYLD_FORCE_FLAT_NAMESPACE");
+	/* Do not DYLD_INTERPOSE SDL_Init: the replacee is this dylib's stub, so
+	   the wrapper sees orig==self, returns -1, and XDL_Init abort()s. */
+	if (pthread_create(&t, NULL, sbpe_deferred_boot, NULL) == 0) {
+		pthread_detach(t);
+	}
+}
 
 static int sbpe_is_game_image(const char *name) {
 	const char *base;
