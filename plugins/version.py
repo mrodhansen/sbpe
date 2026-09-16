@@ -1,9 +1,7 @@
-import colorsys
-import functools
 import math
 import time
 
-from _remote import ffi, lib
+from _remote import ffi
 from manager import PluginBase
 import util
 
@@ -20,16 +18,13 @@ class Plugin(PluginBase):
             return
         menu.version.asUIElement.show = False
         if len(self.vtxt.text) == 0:
-            sbver = ffi.string(menu.version.text.s).decode()
+            sbver = util.getstr(menu.version.text)
             self.vtxt.text = VTEMPLATE.format(sbver, self.refs)
 
     def onPresent(self):
         if self.refs.MainMenu == ffi.NULL:
             return
         t = time.perf_counter()
-        # col = colorsys.hsv_to_rgb((t % 10) / 10, 0.7, 1)
-        # col = functools.reduce(lambda c, x: (c << 8) + int(x * 255), col, 0)
-        # self.vtxt.color = col
         self.vtxt.alpha = abs(math.sin(t * 2)) * 0.7 + 0.3
         self.vtxt.draw(4, self.refs.windowH - 4, anchorY=1)
 

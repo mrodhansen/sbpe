@@ -4,19 +4,17 @@ typedef unsigned char bool;
 // C++ structs (as observed)
 
 // std::string
+#ifdef __APPLE__
+struct STDString {
+  unsigned char _raw[24];
+};
+#else
 struct STDString {
   char *s;
   // actual layout near the string pointer's address:
   //     int length, int capacity, int refcount, char string[length], \0
-  //
-  // to "free": refcount--; if (refcount < 0) free(s - 12) (potentially dangerous)
-  // to "create":
-  //   buf = malloc(length + 13)
-  //   (int*)(buf) = (int*)(buf + 4) = length
-  //   (int*)(buf + 8) = 0
-  //   memcpy(buf + 12, string, length + 1)
-  //   return buf + 12
 };
+#endif
 
 // std::vector
 struct STDVector { // length = v.finish - v.start / sizeof(elem_type)

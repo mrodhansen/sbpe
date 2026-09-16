@@ -17,9 +17,9 @@
 
 ## OS support
 
-- Windows: yes
-- Mac: no
-- Linux: no
+- Windows: yes (process inject via mayhem)
+- Mac: yes (x86_64 `remote.bin` + `launcher_mac` / DYLD insert; Apple Silicon via Rosetta)
+- Linux: yes (`LD_PRELOAD` + ELF ASLR slide)
 
 ## Download
 
@@ -31,10 +31,13 @@ https://github.com/atomizer/sbpe/releases
 
 - set correct game path in `config.ini`
 - on windows, start `run.bat`
+- on mac, run `./build.sh` once, then `./run.sh`
+- on linux, run `./build.sh` once, then `./run.sh` (`libsdl2-dev`, `python3-dev`, `nm`)
+- Steam: set launch options to `"/absolute/path/to/sbpe/steam_launch.sh" %command%` so Steam wraps the client instead of starting it raw
 
 ## Configure
 
-Copy `config-template.ini` to `config.ini` if you don't have a config file yet.
+Copy `config_template.ini` to `config.ini` if you don't have a config file yet.
 
 ### config file basics
 
@@ -183,16 +186,31 @@ Make sure all dependencies are in place:
 
 - python 3.5+ or pypy3
 - C/C++ compiler that can be found by disttools
-- update submodules: `git submodule update --init --recursive`
-- python modules: `cffi` (built-in on pypy), `Pillow`, `protobuf`
+- update submodules: `git submodule update --init --recursive` (subhook is vendored from a maintained ARM64 fork because Zeex/subhook is gone)
+- python modules: `cffi` (built-in on pypy), `Pillow`, `protobuf` (`pip install -r requirements.txt`)
 - SDL: install [development libraries](https://libsdl.org/download-2.0.php) for the version used by the game
     - Windows: unzip [this](https://libsdl.org/release/SDL2-devel-2.0.4-VC.zip) into `libs/SDL`
     - Linux: install `libsdl2-dev`
-- symquery: download DrMemory release for the appropriate platform and copy symquery to `symquery/{Windows,Linux,Darwin}/bin`
+    - Mac: `brew install sdl2`
+- symquery: Windows still needs DrMemory `symquery` at `symquery/{Windows,Linux,Darwin}/bin`. Mac/Linux use `nm`.
 
-to compile, run `rectbinpack/rbp_builder.py` and `builder.py`.
+to compile, run `./build.sh` (Mac/Linux) or `rectbinpack/rbp_builder.py` and `builder.py` on Windows.
 
-To make linux binaries distributable, need to set relative RUNPATH:
+### Mac notes
+
+StarBreak's Mac client is x86_64. `./build.sh` builds `remote.bin` and `launcher_mac` as x86_64. A native arm64 dylib will not inject.
+
+macOS may strip `DYLD_INSERT_LIBRARIES` when the parent is arm64 or the game is hardened. SBPE uses `launcher_mac` so insertion still happens for the unsigned Steam client. If `remote.log` never appears, insertion failed.
+
+libc++ `std::string` is 24 bytes on Darwin (patched in `internals.h`). Stage walking is on; remaining `generated.h` field layouts are still unverified and can crash some plugins.
+
+### Linux notes
+
+The Steam client is typically `~/.steam/steam/steamapps/common/StarBreak/mvmmoclient`. Inject uses `LD_PRELOAD=build/remote.bin`. PIE/ASLR slide comes from `dl_iterate_phdr` (not image 0 / the preload itself). Do not link distro `libSDL2` into `remote.bin`; SDL resolves from the game at load.
+
+If `remote.log` never shows `startup ok`, preload was blocked (setuid, SELinux, or a stripped binary).
+
+To make linux binaries distributable, set relative RUNPATH:
 ```
 patchelf --set-rpath $ORIGIN/../pypy/lib build/remote.bin
 patchelf --set-rpath $ORIGIN/../pypy/lib rectbinpack/_rbp.so
@@ -210,7 +228,7 @@ for plugin ideas see `notes.txt`
 - cffi: https://cffi.readthedocs.io
 - symquery: part of https://github.com/DynamoRIO/drmemory
 - mayhem: https://github.com/zeroSteiner/mayhem
-- subhook: https://github.com/Zeex/subhook
+- subhook: https://github.com/NathanKanaeru/subhook-arm64 (Zeex/subhook is gone)
 - plthook: https://github.com/kubo/plthook
 - rectbinpack: based on https://github.com/juj/RectangleBinPack
 

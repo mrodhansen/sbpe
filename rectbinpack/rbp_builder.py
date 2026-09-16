@@ -1,4 +1,7 @@
 import cffi
+import os
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 SRCLIST = 'Rect.cpp MaxRectsBinPack.cpp'.split()
 

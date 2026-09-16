@@ -1,3 +1,5 @@
+import logging
+import platform
 import time
 
 from _remote import ffi, lib
@@ -48,7 +50,12 @@ class Plugin(PluginBase):
             props = obj.props
             if self.config.hide_shells:
                 # fail: triggers game's "unknown object" box drawing
-                ffi.cast('int *', props.vid.s)[-3] = 0
+                if platform.system() == 'Darwin':
+                    if not getattr(self, '_logged_darwin_shells', False):
+                        logging.warning('hide_shells is unsupported on Darwin')
+                        self._logged_darwin_shells = True
+                elif props.vid != ffi.NULL:
+                    ffi.cast('int *', props.vid.s)[-3] = 0
 
             if self.config.hide_names:
                 # remember and remove relevant bits; also hides factions
@@ -59,7 +66,12 @@ class Plugin(PluginBase):
                 # hide only faction names by zeroing faction name length
                 if props.playerdata != ffi.NULL:
                     fname = props.playerdata.factionname
-                    ffi.cast('int *', fname.s)[-3] = 0
+                    if platform.system() == 'Darwin':
+                        if not getattr(self, '_logged_darwin_factions', False):
+                            logging.warning('hide_factions is unsupported on Darwin')
+                            self._logged_darwin_factions = True
+                    elif fname != ffi.NULL:
+                        ffi.cast('int *', fname.s)[-3] = 0
 
             if self.config.hide_healthbars:
                 # not sure if this breaks anything

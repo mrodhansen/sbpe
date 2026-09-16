@@ -1,4 +1,7 @@
 build/
+.venv/
+.venv-x86/
+.peer-review/
 symquery/
 misc/*.h
 libs/SDL
@@ -6,9 +9,13 @@ libs/SDL
 *.log
 Release/
 *.pyd
+*.so
+*.o
 rectbinpack/_rbp.cpp
 pypy/
 config.ini
 plugins/test.py
 symbols.json
 out/
+sprite-packs/
+sprite-backups/

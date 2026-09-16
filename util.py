@@ -1,7 +1,6 @@
 import logging
 import math
-
-from PIL import Image
+import platform
 
 from _remote import ffi, lib
 
@@ -224,6 +223,8 @@ def loadGLFunctions():
 
 
 def loadMipmaps(pname, sheet):
+    from PIL import Image
+
     if GLFUNCTIONS[0] not in refs:
         loadGLFunctions()
 
@@ -256,6 +257,19 @@ def updateState():
     if GLFUNCTIONS[0] not in refs:
         loadGLFunctions()
 
+    # window size and scale from SDL — safe on every platform
+    if refs.window_[0] != ffi.NULL:
+        ww_ = ffi.new('int *')
+        wh_ = ffi.new('int *')
+        lib.SDL_GetWindowSize(refs.window_[0], ww_, wh_)
+        ww = ww_[0]
+        wh = wh_[0]
+        if ww > 0 and wh > 0:
+            refs.windowW = ww
+            refs.windowH = wh
+            refs.scaleX = refs.canvasW_[0] / ww
+            refs.scaleY = refs.canvasH_[0] / wh
+
     if refs.stage[0] == ffi.NULL:
         return
 
@@ -270,6 +284,14 @@ def updateState():
         tops.append(t)
     refs.tops = tops
     refs.topTypes = types
+    if types and types != getattr(updateState, '_lastTypes', None):
+        logging.info('stage tops: %s', types)
+        updateState._lastTypes = list(types)
+
+    if not types:
+        refs.MainMenu = refs.GameClient = refs.WorldClient = refs.ClientWorld =\
+            refs.WorldView = ffi.NULL
+        return
 
     # main menu
     if types[0] == 'MainMenu':
@@ -290,23 +312,33 @@ def updateState():
             if refs.ClientWorld == ffi.NULL or refs.WorldView == ffi.NULL:
                 refs.ClientWorld = refs.WorldView = ffi.NULL
 
-    # window size and scale
-    ww_ = ffi.new('int *')
-    wh_ = ffi.new('int *')
-    lib.SDL_GetWindowSize(refs.window_[0], ww_, wh_)
-    ww = ww_[0] or 1  # avoid potential division by zero
-    wh = wh_[0] or 1
-    refs.windowW = ww
-    refs.windowH = wh
-    refs.scaleX = refs.canvasW_[0] / ww
-    refs.scaleY = refs.canvasH_[0] / wh
-
     # add more useful things here
 
 
 def getstr(stdstring):
     if stdstring == ffi.NULL:
         return '(NULL)'
+    if platform.system() == 'Darwin':
+        # libc++ std::string (Apple / darwin13 layout): 24-byte SSO.
+        # long: byte0 LSB=1, size at +8, data ptr at +16
+        # short: byte0 = size<<1, chars at +1
+        if ffi.typeof(stdstring).kind == 'pointer':
+            raw = stdstring
+        else:
+            raw = ffi.addressof(stdstring)
+        base = ffi.cast('unsigned char *', raw)
+        first = int(base[0])
+        if first & 1:
+            n = int(ffi.cast('uint64_t *', raw)[1])
+            ptr = ffi.cast('char **', raw)[2]
+        else:
+            n = first >> 1
+            ptr = ffi.cast('char *', raw) + 1
+        if ptr == ffi.NULL or n > 10000:
+            return '(NULL)'
+        if n <= 0:
+            return ''
+        return bytes(ffi.buffer(ptr, n)).decode('utf-8', errors='replace')
     return ffi.string(stdstring.s, 1000).decode('utf-8', errors='replace')
 
 
@@ -322,6 +354,10 @@ def vec2list(vector, itemtype='void*'):
             vector.endOfStorage <= vector.start:
         return []
     n = (vector.finish - vector.start) // ffi.sizeof(itemtype)
+    if n <= 0:
+        return []
+    if n > 256:
+        n = 256
     return ffi.unpack(ffi.cast(itemtype + '*', vector.start), n)
 
 
@@ -340,6 +376,15 @@ def worldobjects(subworld):
     return sVecMap2list(subworld.asSubWorldImpl.objs, 'struct WorldObject *')
 
 
+def _ptr_ok(ptr):
+    if ptr == ffi.NULL:
+        return False
+    if platform.system() != 'Darwin':
+        return True
+    addr = int(ffi.cast('uintptr_t', ptr))
+    return 0x100000000 <= addr <= 0x7fffffffffff
+
+
 def getClassName(obj):
     '''
     class name of a C++ object (assuming gcc memory layout).
@@ -347,11 +392,19 @@ def getClassName(obj):
     '''
     if obj == ffi.NULL:
         return 'NULL'
+    if not _ptr_ok(obj):
+        return 'UNKNOWN'
 
     # class pointer is always at [0]
     classptr = ffi.cast('void****', obj)[0]
-    # vtable (1 up) -> type -> name (1 down)
-    nameptr = classptr[-1][1]
+    if not _ptr_ok(classptr):
+        return 'UNKNOWN'
+    typeinfo = classptr[-1]
+    if not _ptr_ok(typeinfo):
+        return 'UNKNOWN'
+    nameptr = typeinfo[1]
+    if not _ptr_ok(nameptr):
+        return 'UNKNOWN'
     cname = ffi.string(ffi.cast('char*', nameptr), 100)
     return cname[1 if len(cname) < 11 else 2:].decode()
 

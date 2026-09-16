@@ -76,7 +76,10 @@ def hook_DoEvents():
 def hook_Clear(color):
     util.updateState()
     refs.manager.runCallbacks('afterUpdate')
-    ORIGS['XDL_Clear'](refs.stage[0].backgroundColor)
+    if platform.system() == 'Darwin':
+        ORIGS['XDL_Clear'](color)
+    else:
+        ORIGS['XDL_Clear'](refs.stage[0].backgroundColor)
 
 
 @ffi.def_extern()
@@ -144,7 +147,10 @@ def hook_textureCallback(texture, sptr):
 
 
 def initHooks():
+    ok = True
+
     def addhook(fname, hookfunc, ret=False):
+        nonlocal ok
         hook = lib.subhook_new(refs[fname], hookfunc, 1)
         orig = ffi.cast('p' + fname, lib.subhook_get_trampoline(hook))
         if orig != ffi.NULL:
@@ -164,6 +170,7 @@ def initHooks():
         lib.subhook_install(hook)
         if not lib.subhook_is_installed(hook):
             logging.error('failed to hook {}'.format(fname))
+            ok = False
 
     addhook('XDL_DoEvents', lib.hook_DoEvents)
     addhook('XDL_Clear', lib.hook_Clear)
@@ -175,12 +182,25 @@ def initHooks():
 
     if refs.config.getboolean('general', 'mipmaps', fallback=False):
         addhook('XDL_LoadTextureFile', lib.hook_LoadTextureFile)
+    return ok
 
 
 # startup ####################################################################
 
 @ffi.def_extern()
 def kickstart():
+    global refs, util
+    try:
+        return _kickstart()
+    except Exception:
+        try:
+            logging.exception('kickstart failed')
+        except Exception:
+            sys.stderr.write('kickstart failed\n')
+        return 1
+
+
+def _kickstart():
     global refs, util
 
     SYMFILE = os.environ['SBPE_SYMFILE']
@@ -201,11 +221,21 @@ def kickstart():
     logging.info('platform: ' + refs.SYSINFO)
 
     refs.CONFIGFILE = os.path.join(refs.SCRIPTPATH, CONFIGFILE)
-    refs.config.read(refs.CONFIGFILE)
+    if not refs.config.read(refs.CONFIGFILE):
+        logging.error('could not read {}'.format(refs.CONFIGFILE))
+        return 1
+
+    slide = 0
+    if platform.system() in ('Darwin', 'Linux'):
+        slide = lib.sbpe_image_slide()
+        if not lib.sbpe_image_found():
+            logging.error('could not find game image for ASLR slide')
+            return 1
+        logging.info('image slide: 0x{:x}'.format(slide))
 
     # import native functions/objects
     for sname in offsets:
-        offset = offsets[sname]
+        offset = offsets[sname] + slide
         if sname in SYMTYPES:
             # objects, variables
             refs[sname] = ffi.cast(SYMTYPES[sname], offset)
@@ -231,8 +261,12 @@ def kickstart():
     man = importlib.import_module('manager')
     refs.manager = man.Manager(path=plugpath, refs=refs)
 
-    # init hooks
-    initHooks()
+    if not initHooks():
+        logging.error('required hooks failed')
+        return 1
+
+    for key in ('SBPE_SYMFILE', 'PYTHONPATH', 'PYTHONHOME'):
+        os.environ.pop(key, None)
 
     logging.info('startup ok')
     return 0
