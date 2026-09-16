@@ -293,6 +293,13 @@ def updateState():
             refs.WorldView = ffi.NULL
         return
 
+    # generated.h WorldClient/ClientWorld offsets do not match the Mac client.
+    # Reading them SIGSEGVs in onPresent (fps timeReserve, hud, map, ...).
+    if platform.system() == 'Darwin':
+        refs.MainMenu = refs.GameClient = refs.WorldClient = refs.ClientWorld =\
+            refs.WorldView = ffi.NULL
+        return
+
     # main menu
     if types[0] == 'MainMenu':
         refs.MainMenu = tops[0]
